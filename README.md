@@ -1,7 +1,9 @@
-# rumqttc
+# rumqttc-async-std
+
+A fork of the rumqttc library found [here](https://github.com/bytebeamio/rumqtt/), changed to use async-std instead of the tokio asynchronous runtime.
 
 A pure rust MQTT client which strives to be robust, efficient and easy to use.
-This library is backed by an async (tokio) eventloop which handles all the
+This library is backed by an async (async-std) eventloop which handles all the
 robustness and and efficiency parts of MQTT but naturally fits into both sync
 and async worlds as we'll see
 
@@ -36,7 +38,7 @@ A simple asynchronous publish and subscribe
 
 ```rust
 use rumqttc::{MqttOptions, AsyncClient, QoS};
-use tokio::{task, time};
+use async_std::task;
 use std::time::Duration;
 use std::error::Error;
 
@@ -49,7 +51,7 @@ client.subscribe("hello/rumqtt", QoS::AtMostOnce).await.unwrap();
 task::spawn(async move {
     for i in 0..10 {
         client.publish("hello/rumqtt", QoS::AtLeastOnce, false, vec![i; i as usize]).await.unwrap();
-        time::sleep(Duration::from_millis(100)).await;
+        task::sleep(Duration::from_millis(100)).await;
     }
 });
 
