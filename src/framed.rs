@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use mqttbytes::v4::*;
 use mqttbytes::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Incoming, MqttState, StateError};
 use std::io;
@@ -35,7 +35,7 @@ impl Network {
     async fn read_bytes(&mut self, required: usize) -> io::Result<usize> {
         let mut total_read = 0;
         loop {
-            let read = self.socket.read_buf(&mut self.read).await?;
+            let read = self.socket.read(&mut self.read).await?;
             if 0 == read {
                 return if self.read.is_empty() {
                     Err(io::Error::new(

@@ -4,11 +4,13 @@ use crate::{MqttOptions, Outgoing};
 
 use async_channel::{bounded, Receiver, Sender};
 #[cfg(feature = "websocket")]
-use async_tungstenite::tokio::{connect_async, connect_async_with_tls_connector};
+use async_tungstenite::async_std::{connect_async, connect_async_with_tls_connector};
 use mqttbytes::v4::*;
-use tokio::net::TcpStream;
-use tokio::select;
-use tokio::time::{self, error::Elapsed, Instant, Sleep};
+use async_std::net::TcpStream;
+use async_std::future::TimeoutError;
+use futures::select;
+use futures::future::FutureExt;
+use async_io::Timer;
 #[cfg(feature = "websocket")]
 use ws_stream_tungstenite::WsStream;
 
@@ -16,6 +18,7 @@ use std::io;
 use std::pin::Pin;
 use std::time::Duration;
 use std::vec::IntoIter;
+use crate::cond_fut::cond_fut;
 
 /// Critical errors during eventloop polling
 #[derive(Debug, thiserror::Error)]
@@ -23,7 +26,7 @@ pub enum ConnectionError {
     #[error("Mqtt state: {0}")]
     MqttState(#[from] StateError),
     #[error("Timeout")]
-    Timeout(#[from] Elapsed),
+    Timeout(#[from] TimeoutError),
     #[error("Packet parsing error: {0}")]
     Mqtt4Bytes(mqttbytes::Error),
     #[error("Network: {0}")]
@@ -53,7 +56,7 @@ pub struct EventLoop {
     /// Network connection to the broker
     pub(crate) network: Option<Network>,
     /// Keep alive time
-    pub(crate) keepalive_timeout: Option<Pin<Box<Sleep>>>,
+    pub(crate) keepalive_timeout: Option<Pin<Box<Timer>>>,
     /// Handle to read cancellation requests
     pub(crate) cancel_rx: Receiver<()>,
     /// Handle to send cancellation requests (and drops)
@@ -123,7 +126,7 @@ impl EventLoop {
             self.network = Some(network);
 
             if self.keepalive_timeout.is_none() {
-                self.keepalive_timeout = Some(Box::pin(time::sleep(self.options.keep_alive)));
+                self.keepalive_timeout = Some(Box::pin(Timer::after(self.options.keep_alive)));
             }
 
             return Ok(Event::Incoming(connack));
@@ -162,7 +165,7 @@ impl EventLoop {
         // instead of returning a None event, we try again.
         select! {
             // Pull a bunch of packets from network, reply in bunch and yield the first item
-            o = network.readb(&mut self.state) => {
+            o = network.readb(&mut self.state).fuse() => {
                 o?;
                 // flush all the acks and return first incoming packet
                 network.flush(&mut self.state.write).await?;
@@ -192,7 +195,7 @@ impl EventLoop {
             // After collision with pkid 1        -> [1b ,2, x, 4, 5].
             // 1a is saved to state and event loop is set to collision mode stopping new
             // outgoing requests (along with 1b).
-            o = self.requests_rx.recv(), if !inflight_full && !pending && !collision => match o {
+            o = cond_fut(self.requests_rx.recv().fuse(), !inflight_full && !pending && !collision) => match o {
                 Ok(request) => {
                     self.state.handle_outgoing_packet(request)?;
                     network.flush(&mut self.state.write).await?;
@@ -202,23 +205,27 @@ impl EventLoop {
             },
             // Handle the next pending packet from previous session. Disable
             // this branch when done with all the pending packets
-            Some(request) = next_pending(throttle, &mut self.pending), if pending => {
-                self.state.handle_outgoing_packet(request)?;
-                network.flush(&mut self.state.write).await?;
-                Ok(self.state.events.pop_front().unwrap())
+            request = cond_fut(next_pending(throttle, &mut self.pending).fuse(), pending) => {
+                if let Some(request) = request {
+                    self.state.handle_outgoing_packet(request)?;
+                    network.flush(&mut self.state.write).await?;
+                    Ok(self.state.events.pop_front().unwrap())
+                } else {
+                    unreachable!()
+                }
             },
             // We generate pings irrespective of network activity. This keeps the ping logic
             // simple. We can change this behavior in future if necessary (to prevent extra pings)
-            _ = self.keepalive_timeout.as_mut().unwrap() => {
+            _ = self.keepalive_timeout.as_mut().unwrap().fuse() => {
                 let timeout = self.keepalive_timeout.as_mut().unwrap();
-                timeout.as_mut().reset(Instant::now() + self.options.keep_alive);
+                timeout.as_mut().set_after(self.options.keep_alive);
 
                 self.state.handle_outgoing_packet(Request::PingReq)?;
                 network.flush(&mut self.state.write).await?;
                 Ok(self.state.events.pop_front().unwrap())
             }
             // cancellation requests to stop the polling
-            _ = self.cancel_rx.recv() => {
+            _ = self.cancel_rx.recv().fuse() => {
                 Err(ConnectionError::Cancel)
             }
         }
@@ -229,8 +236,8 @@ async fn connect_or_cancel(options: &MqttOptions, cancel_rx: &Receiver<()>) -> R
     // select here prevents cancel request from being blocked until connection request is
     // resolved. Returns with an error if connections fail continuously
     select! {
-        o = connect(options) => o,
-        _ = cancel_rx.recv() => {
+        o = connect(options).fuse() => o,
+        _ = cancel_rx.recv().fuse() => {
             Err(ConnectionError::Cancel)
         }
     }
@@ -327,14 +334,14 @@ async fn mqtt_connect(options: &MqttOptions, network: &mut Network) -> Result<In
     }
 
     // mqtt connection with timeout
-    time::timeout(Duration::from_secs(options.connection_timeout()), async {
+    async_std::future::timeout(Duration::from_secs(options.connection_timeout()), async {
         network.connect(connect).await?;
         Ok::<_, ConnectionError>(())
     })
     .await??;
 
     // wait for 'timeout' time to validate connack
-    let packet = time::timeout(Duration::from_secs(options.connection_timeout()), async {
+    let packet = async_std::future::timeout(Duration::from_secs(options.connection_timeout()), async {
         let packet = match network.read().await? {
             Incoming::ConnAck(connack) if connack.code == ConnectReturnCode::Success => Packet::ConnAck(connack),
             Incoming::ConnAck(connack) => {
@@ -358,6 +365,6 @@ async fn mqtt_connect(options: &MqttOptions, network: &mut Network) -> Result<In
 /// This is a synchronous function but made async to make it fit in select!
 pub(crate) async fn next_pending(delay: Duration, pending: &mut IntoIter<Request>) -> Option<Request> {
     // return next packet with a delay
-    time::sleep(delay).await;
+    Timer::after(delay).await;
     pending.next()
 }

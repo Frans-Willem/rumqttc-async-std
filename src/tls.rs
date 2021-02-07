@@ -1,8 +1,8 @@
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::internal::pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use tokio_rustls::rustls::{ClientConfig, TLSError};
-use tokio_rustls::webpki::{self, DNSNameRef, InvalidDNSNameError};
-use tokio_rustls::{client::TlsStream, TlsConnector};
+use async_std::net::TcpStream;
+use rustls::internal::pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls::{ClientConfig, TLSError};
+use webpki::{self, InvalidDNSNameError};
+use async_tls::{client::TlsStream, TlsConnector};
 
 use crate::{Key, MqttOptions, TlsConfiguration};
 
@@ -100,7 +100,7 @@ pub async fn tls_connect(
     let addr = options.broker_addr.as_str();
     let port = options.port;
     let connector = tls_connector(tls_config).await?;
-    let domain = DNSNameRef::try_from_ascii_str(&options.broker_addr)?;
+    let domain = &options.broker_addr;
     let tcp = TcpStream::connect((addr, port)).await?;
     let tls = connector.connect(domain, tcp).await?;
     Ok(tls)

@@ -6,9 +6,6 @@ use async_channel::{SendError, Sender, TrySendError};
 use bytes::Bytes;
 use mqttbytes::v4::*;
 use mqttbytes::*;
-use std::mem;
-use tokio::runtime;
-use tokio::runtime::Runtime;
 
 /// Client Error
 #[derive(Debug, thiserror::Error)]
@@ -142,9 +139,8 @@ impl Client {
     pub fn new(options: MqttOptions, cap: usize) -> (Client, Connection) {
         let (client, eventloop) = AsyncClient::new(options, cap);
         let client = Client { client };
-        let runtime = runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        let connection = Connection::new(eventloop, runtime);
+        let connection = Connection::new(eventloop);
         (client, connection)
     }
 
@@ -194,12 +190,11 @@ impl Client {
 ///  MQTT connection. Maintains all the necessary state
 pub struct Connection {
     pub eventloop: EventLoop,
-    runtime: Option<Runtime>,
 }
 
 impl Connection {
-    fn new(eventloop: EventLoop, runtime: Runtime) -> Connection {
-        Connection { eventloop, runtime: Some(runtime) }
+    fn new(eventloop: EventLoop) -> Connection {
+        Connection { eventloop }
     }
 
     /// Returns an iterator over this connection. Iterating over this is all that's
@@ -208,15 +203,13 @@ impl Connection {
     /// **NOTE** Don't block this while iterating
     #[must_use = "Connection should be iterated over a loop to make progress"]
     pub fn iter(&mut self) -> Iter {
-        let runtime = self.runtime.take().unwrap();
-        Iter { connection: self, runtime }
+        Iter { connection: self }
     }
 }
 
 /// Iterator which polls the eventloop for connection progress
 pub struct Iter<'a> {
     connection: &'a mut Connection,
-    runtime: runtime::Runtime,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -224,7 +217,7 @@ impl<'a> Iterator for Iter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let f = self.connection.eventloop.poll();
-        match self.runtime.block_on(f) {
+        match async_std::task::block_on(f) {
             Ok(v) => Some(Ok(v)),
             // closing of request channel should stop the iterator
             Err(ConnectionError::RequestsDone) => {
@@ -237,13 +230,5 @@ impl<'a> Iterator for Iter<'a> {
             }
             Err(e) => Some(Err(e)),
         }
-    }
-}
-
-impl<'a> Drop for Iter<'a> {
-    fn drop(&mut self) {
-        // TODO: Don't create new runtime in drop
-        let runtime = runtime::Builder::new_current_thread().build().unwrap();
-        self.connection.runtime = Some(mem::replace(&mut self.runtime, runtime));
     }
 }
